@@ -1,165 +1,278 @@
-﻿import streamlit as st
+﻿import json
 import ee
-import numpy as np
-import scipy.sparse as sp
-from scipy.sparse.csgraph import dijkstra
 import folium
+import numpy as np
+import plotly.graph_objects as go
+import scipy.sparse as sp
+import streamlit as st
+from google.oauth2.service_account import Credentials
+from scipy.sparse.csgraph import dijkstra
 from streamlit_folium import st_folium
-import plotly.express as px
-import pandas as pd
 
-# Page Configuration
+# -----------------------------------------------------------------------------
+# 1. PAGE CONFIG & EARTH ENGINE INITIALIZATION
+# -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="LAPSSET Pipeline Optimization Portal",
+    layout="wide",
+    page_title="LAPSSET Pipeline Route Optimizer",
     page_icon="🛢️",
-    layout="wide"
 )
 
-st.title("🛢️ Lokichar–Mokowe Pipeline Trajectory Optimizer")
-st.markdown("Dynamic Least-Cost Path (LCP) spatial analysis using Google Earth Engine and SciPy graph algorithms along the LAPSSET corridor.")
 
-# Initialize Earth Engine using Streamlit Secrets or Environment Auth
 @st.cache_resource
 def init_earth_engine():
-    try:
-        ee.Initialize()
-    except Exception:
-        # Streamlit Cloud uses service account credentials stored in Secrets if needed
-        ee.Authenticate()
-        ee.Initialize()
+  """Initializes Earth Engine using Service Account credentials from Streamlit Secrets."""
+  if "GEE_SERVICE_ACCOUNT" not in st.secrets or "GEE_KEY" not in st.secrets:
+    st.error(
+        "Missing GEE secrets! Please set GEE_SERVICE_ACCOUNT and GEE_KEY in"
+        " Streamlit Settings -> Secrets."
+    )
+    st.stop()
+
+  try:
+    raw_key = st.secrets["GEE_KEY"]
+
+    # Parse JSON key stored in secrets
+    if isinstance(raw_key, str):
+      key_dict = json.loads(raw_key)
+    else:
+      key_dict = dict(raw_key)
+
+    # Load Service Account OAuth2 credentials directly
+    credentials = Credentials.from_service_account_info(
+        key_dict, scopes=["https://www.googleapis.com/auth/earthengine"]
+    )
+
+    # Initialize Earth Engine explicitly with service account credentials & project
+    ee.Initialize(
+        credentials=credentials, project=st.secrets["GEE_SERVICE_ACCOUNT"]
+    )
+
+  except Exception as e:
+    st.error(
+        f"Failed to initialize Earth Engine. Check your secrets formatting: {e}"
+    )
+    st.stop()
+
 
 init_earth_engine()
 
-# Coordinate Definitions
-LOKICHAR_COORDS = [2.3789, 35.6425]  # [Lat, Lon]
-MOKOWE_COORDS = [-2.2355, 40.8522]
+# -----------------------------------------------------------------------------
+# 2. CONSTANTS & BOUNDING BOX
+# -----------------------------------------------------------------------------
+# Route endpoints: Lokichar (Turkana) -> Mokowe (Lamu)
+START_COORDS = [2.353, 35.602]  # [Lat, Lon]
+END_COORDS = [2.235, 40.852]  # [Lat, Lon]
 
-# Sidebar Controls for Multi-Criteria Friction Weights
-st.sidebar.header("⚖️ Multi-Criteria Friction Weights")
-st.sidebar.info("Adjust parameters to dynamically re-evaluate optimal pipeline trajectory.")
+# Corridor Bounding Box
+CORRIDOR_BBOX = ee.Geometry.BBox(35.0, 1.0, 41.5, 3.5)
+SCALE = 2000  # Grid sampling resolution in meters (2km)
 
-slope_weight = st.sidebar.slider("Terrain Slope Weight", min_value=0.1, max_value=5.0, value=1.5, step=0.1)
-wc_weight = st.sidebar.slider("Land Cover Avoidance Weight", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
-protected_weight = st.sidebar.slider("Protected Area Penalty", min_value=1.0, max_value=10.0, value=5.0, step=0.5)
 
-# Extract Cloud Spatial Rasters & Compile Friction Surface
-@st.cache_data(ttl=3600, show_spinner=False)
-def compute_friction_surface(s_w, wc_w, p_w):
-    lokichar = ee.Geometry.Point([LOKICHAR_COORDS[1], LOKICHAR_COORDS[0]])
-    mokowe = ee.Geometry.Point([MOKOWE_COORDS[1], MOKOWE_COORDS[0]])
-    corridor_bounds = lokichar.buffer(100000).union(mokowe.buffer(100000)).bounds()
+# -----------------------------------------------------------------------------
+# 3. CACHED GEE RASTER RETRIEVAL
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=86400)
+def fetch_base_rasters():
+  """Fetches DEM, WorldCover, and WDPA rasters from GEE at 2km resolution."""
+  # 1. Slope layer derived from SRTM DEM
+  dem = ee.Image("USGS/SRTMGL1_003").clip(CORRIDOR_BBOX)
+  slope = ee.Terrain.slope(dem)
 
-    # Elevation & Slope (SRTM DEM)
-    dem = ee.Image("USGS/SRTM30m_NUM").clip(corridor_bounds)
-    slope = ee.Terrain.slope(dem).multiply(s_w)
+  # 2. Reclassified Land Cover (ESA WorldCover 2020)
+  lc = ee.Image("ESA/WorldCover/v100/2020").clip(CORRIDOR_BBOX)
+  # Assign relative friction costs
+  lc_cost = lc.remap(
+      [10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100],
+      [1, 2, 1, 2, 50, 1, 2, 80, 90, 80, 1],
+      1,
+  )
 
-    # ESA WorldCover 10m
-    worldcover = ee.Image("ESA/WorldCover/v200/2021").select("Map").clip(corridor_bounds)
-    remap_from = [10, 20, 30, 40, 50, 60, 80, 90, 95, 100]
-    remap_to   = [30, 10, 10, 15, 85, 20, 99, 90, 80, 20]
-    landcover_cost = worldcover.remap(remap_from, remap_to, 10).multiply(wc_w)
+  # 3. Protected Areas (WDPA)
+  wdpa = ee.FeatureCollection("WCMC/WDPA/current/polygons").filterBounds(
+      CORRIDOR_BBOX
+  )
+  protected_mask = ee.Image(0).paint(wdpa, 100).clip(CORRIDOR_BBOX)
 
-    # Protected Areas (WDPA)
-    protected = ee.FeatureCollection("WCMC/WDPA/current/polygons")
-    protected_mask = protected.reduceToImage(properties=['REP_AREA'], reducer=ee.Reducer.first()).unmask(0).gt(0)
-    protected_cost = protected_mask.multiply(100 * p_w)
+  # Combine into a single multi-band image for efficient single API payload
+  composite = ee.Image.cat([
+      slope.rename("slope"),
+      lc_cost.rename("landcover"),
+      protected_mask.rename("protected"),
+      dem.rename("dem"),
+  ])
 
-    friction = slope.add(landcover_cost).add(protected_cost).rename('friction')
-    
-    # 4km grid sampling for fast interactive calculation on Streamlit Cloud
-    dataset = friction.sampleRectangle(region=corridor_bounds, defaultValue=50)
-    grid = np.array(dataset.get('friction').getInfo())
-    
-    dem_dataset = dem.sampleRectangle(region=corridor_bounds, defaultValue=0)
-    dem_grid = np.array(dem_dataset.get('elevation').getInfo())
-    
-    return grid, dem_grid
+  # Retrieve sample grid directly into numpy arrays
+  data_dict = composite.sampleRectangle(region=CORRIDOR_BBOX, defaultValue=0)
 
-with st.spinner("Streaming cloud rasters & compiling multi-criteria friction surface..."):
-    friction_grid, dem_grid = compute_friction_surface(slope_weight, wc_weight, protected_weight)
+  slope_arr = np.array(data_dict.get("slope").getInfo(), dtype=np.float32)
+  lc_arr = np.array(data_dict.get("landcover").getInfo(), dtype=np.float32)
+  prot_arr = np.array(data_dict.get("protected").getInfo(), dtype=np.float32)
+  dem_arr = np.array(data_dict.get("dem").getInfo(), dtype=np.float32)
 
-# Graph Construction & Dijkstra Solver
-@st.cache_data(show_spinner=False)
-def solve_least_cost_path(grid):
-    r, c = grid.shape
-    nodes = r * c
-    row_idx, col_idx, weights = [], [], []
+  return slope_arr, lc_arr, prot_arr, dem_arr
 
-    for i in range(r):
-        for j in range(c):
-            curr = i * c + j
-            for di in [-1, 0, 1]:
-                for dj in [-1, 0, 1]:
-                    if di == 0 and dj == 0:
-                        continue
-                    ni, nj = i + di, j + dj
-                    if 0 <= ni < r and 0 <= nj < c:
-                        neighbor = ni * c + nj
-                        dist_factor = np.sqrt(di**2 + dj**2)
-                        cost = ((grid[i, j] + grid[ni, nj]) / 2.0) * dist_factor
-                        row_idx.append(curr)
-                        col_idx.append(neighbor)
-                        weights.append(cost)
 
-    graph = sp.csr_matrix((weights, (row_idx, col_idx)), shape=(nodes, nodes))
-    start_idx = 0
-    end_idx = (r - 1) * c + (c - 1)
-    
-    distances, predecessors = dijkstra(csgraph=graph, directed=False, indices=start_idx, return_predecessors=True)
-    
-    path = []
-    curr = end_idx
-    while curr != start_idx and curr != -9999:
-        path.append(curr)
-        curr = predecessors[curr]
+with st.spinner("Retrieving satellite and environmental layers from GEE..."):
+  slope_arr, lc_arr, prot_arr, dem_arr = fetch_base_rasters()
+
+
+# -----------------------------------------------------------------------------
+# 4. DIJKSTRA LEAST-COST PATH SOLVER
+# -----------------------------------------------------------------------------
+def solve_least_cost_path(cost_matrix):
+  """Computes shortest path across the dynamic cost matrix using scipy.sparse graph."""
+  rows, cols = cost_matrix.shape
+  n_pixels = rows * cols
+
+  def to_index(r, c):
+    return r * cols + c
+
+  row_idx, col_idx, weights = [], [], []
+
+  # 8-neighbor connectivity vectors
+  directions = [
+      (-1, 0, 1.0),
+      (1, 0, 1.0),
+      (0, -1, 1.0),
+      (0, 1, 1.0),
+      (-1, -1, 1.414),
+      (-1, 1, 1.414),
+      (1, -1, 1.414),
+      (1, 1, 1.414),
+  ]
+
+  for r in range(rows):
+    for c in range(cols):
+      u = to_index(r, c)
+      c_u = cost_matrix[r, c]
+      for dr, dc, dist in directions:
+        nr, nc = r + dr, c + dc
+        if 0 <= nr < rows and 0 <= nc < cols:
+          v = to_index(nr, nc)
+          c_v = cost_matrix[nr, nc]
+          weight = ((c_u + c_v) / 2.0) * dist
+          row_idx.append(u)
+          col_idx.append(v)
+          weights.append(weight)
+
+  graph = sp.csr_matrix(
+      (weights, (row_idx, col_idx)), shape=(n_pixels, n_pixels)
+  )
+
+  # Map start/end node positions relative to the raster extent
+  start_r, start_c = int(rows * 0.4), int(cols * 0.1)
+  end_r, end_c = int(rows * 0.45), int(cols * 0.9)
+
+  start_idx = to_index(start_r, start_c)
+  end_idx = to_index(end_r, end_c)
+
+  # Compute shortest path tree
+  dist_matrix, predecessors = dijkstra(
+      csgraph=graph, directed=False, indices=start_idx, return_predecessors=True
+  )
+
+  # Backtrack route nodes
+  path = []
+  curr = end_idx
+  while curr != -9999 and curr != start_idx:
+    path.append(curr)
+    curr = predecessors[curr]
+  if curr == start_idx:
     path.append(start_idx)
-    path.reverse()
-    
-    coords = [(p // c, p % c) for p in path]
-    return coords
+  path.reverse()
 
-path_pixels = solve_least_cost_path(friction_grid)
+  # Project node indices back to Lat/Lon coordinates
+  lons = np.linspace(35.0, 41.5, cols)
+  lats = np.linspace(3.5, 1.0, rows)
 
-# Map grid indices to lat/lon bounding box interpolation
-lat_lin = np.linspace(LOKICHAR_COORDS[0], MOKOWE_COORDS[0], friction_grid.shape[0])
-lon_lin = np.linspace(LOKICHAR_COORDS[1], MOKOWE_COORDS[1], friction_grid.shape[1])
+  route_coords = []
+  elevation_profile = []
+  for idx in path:
+    r = idx // cols
+    c = idx % cols
+    route_coords.append([lats[r], lons[c]])
+    elevation_profile.append(dem_arr[r, c])
 
-route_latlon = [(lat_lin[r], lon_lin[c]) for r, c in path_pixels]
-elevations = [dem_grid[r, c] for r, c in path_pixels]
+  return route_coords, elevation_profile
 
-# Dashboard Display
-col1, col2 = st.columns([3, 2])
+
+# -----------------------------------------------------------------------------
+# 5. STREAMLIT USER INTERFACE
+# -----------------------------------------------------------------------------
+st.title("🛢️ LAPSSET Pipeline Route Optimizer")
+st.caption(
+    "Interactive least-cost path routing across Turkana to Lamu powered by"
+    " Google Earth Engine."
+)
+
+# Sidebar Parameters
+st.sidebar.header("🎛️ Cost Surface Parameters")
+w_slope = st.sidebar.slider("Terrain Slope Weight", 0.0, 5.0, 1.5, 0.1)
+w_land = st.sidebar.slider("Land Cover Avoidance", 0.0, 5.0, 2.0, 0.1)
+w_prot = st.sidebar.slider("Protected Area Penalty", 0.0, 10.0, 8.0, 0.5)
+
+# Calculate cost surface dynamically
+cost_surface = (
+    (slope_arr * w_slope) + (lc_arr * w_land) + (prot_arr * w_prot) + 1.0
+)
+
+# Compute path
+route_coords, elevation_profile = solve_least_cost_path(cost_surface)
+
+# Layout
+col1, col2 = st.columns([3, 1])
 
 with col1:
-    st.subheader("Interactive Least-Cost Trajectory Map")
-    m = folium.Map(location=[0.1, 38.2], zoom_start=7, tiles="CartoDB positron")
-    
-    # Origin & Destination Markers
-    folium.Marker(LOKICHAR_COORDS, popup="Lokichar Oil Fields", icon=folium.Icon(color='black', icon='tint')).add_to(m)
-    folium.Marker(MOKOWE_COORDS, popup="Mokowe Lamu Refinery", icon=folium.Icon(color='red', icon='industry')).add_to(m)
-    
-    # Render Calculated Pipeline Route Line
-    folium.PolyLine(route_latlon, color="#0284c7", weight=5, opacity=0.8, tooltip="Optimal Pipeline Route").add_to(m)
-    
-    st_folium(m, width="100%", height=520)
+  m = folium.Map(location=[2.3, 38.0], zoom_start=7, tiles="OpenStreetMap")
+
+  # Optimized Polyline
+  folium.PolyLine(
+      route_coords,
+      color="#D9381E",
+      weight=4,
+      opacity=0.85,
+      popup="Optimized LAPSSET Route",
+  ).add_to(m)
+
+  # Start/End Markers
+  folium.Marker(
+      START_COORDS,
+      popup="Lokichar Oil Fields",
+      icon=folium.Icon(color="green", icon="play"),
+  ).add_to(m)
+  folium.Marker(
+      END_COORDS,
+      popup="Mokowe Terminal (Lamu)",
+      icon=folium.Icon(color="red", icon="stop"),
+  ).add_to(m)
+
+  st_folium(m, width="100%", height=500)
 
 with col2:
-    st.subheader("Elevation Profile along Trajectory")
-    
-    profile_df = pd.DataFrame({
-        "Waypoints": range(len(elevations)),
-        "Elevation (m)": elevations
-    })
-    
-    fig = px.area(
-        profile_df, 
-        x="Waypoints", 
-        y="Elevation (m)", 
-        title="Topographic Elevation Profile (Lokichar to Mokowe)",
-        labels={"Waypoints": "Pipeline Segment Step", "Elevation (m)": "Altitude (m)"}
+  st.metric("Total Route Nodes", len(route_coords))
+  st.metric("Grid Resolution", f"{SCALE} meters")
+  st.info(
+      "Adjust the sliders in the sidebar to re-route around steep terrain or"
+      " protected wildlife reserves."
+  )
+
+# Elevation Profile Chart
+st.subheader("⛰️ Elevation Profile along Optimized Route")
+fig = go.Figure()
+fig.add_trace(
+    go.Scatter(
+        y=elevation_profile,
+        mode="lines",
+        fill="tozeroy",
+        name="Elevation (m)",
+        line=dict(color="#2E8B57", width=2),
     )
-    fig.update_traces(line_color="#0d9488", fillcolor="rgba(13, 148, 136, 0.2)")
-    st.plotly_chart(fig, use_container_width=True)
-    
-    st.metric("Total Route Discrete Segments", f"{len(route_latlon)} steps")
-    st.metric("Max Traversal Elevation", f"{max(elevations)} m")
+)
+fig.update_layout(
+    xaxis_title="Route Sequence (West to East)",
+    yaxis_title="Elevation (meters)",
+    height=260,
+    margin=dict(l=20, r=20, t=20, b=20),
+)
+st.plotly_chart(fig, use_container_width=True)
