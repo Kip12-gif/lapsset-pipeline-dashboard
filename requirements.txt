@@ -1,0 +1,9 @@
+﻿streamlit>=1.30.0
+earthengine-api>=0.1.380
+geopandas>=0.14.0
+folium>=0.15.0
+streamlit-folium>=0.18.0
+scipy>=1.11.0
+numpy>=1.26.0
+plotly>=5.18.0
+shapely>=2.0.0
